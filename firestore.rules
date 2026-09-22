@@ -1,0 +1,236 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isGroupMember(groupId) {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid));
+    }
+
+    function isGroupOwner(groupId) {
+      return isSignedIn() &&
+        get(/databases/$(database)/documents/groups/$(groupId)).data.createdBy == request.auth.uid;
+    }
+
+    // A member who hasn't left and whose group isn't archived. Used to gate
+    // writes (as opposed to isGroupMember, which stays broad and continues
+    // to gate reads, so a member who's left — or a group that's archived —
+    // keeps seeing history, just can't add to it). `.get(key, default)` is
+    // used throughout so this stays safe for documents written before the
+    // `leftAt`/`archived` fields existed — they default to "active".
+    function isActiveGroupMember(groupId) {
+      return isGroupMember(groupId) &&
+        get(/databases/$(database)/documents/groups/$(groupId)/members/$(request.auth.uid)).data.get('leftAt', null) == null &&
+        get(/databases/$(database)/documents/groups/$(groupId)).data.get('archived', false) == false;
+    }
+
+    function isValidInviteForGroup(code, groupId) {
+      let invite = get(/databases/$(database)/documents/inviteCodes/$(code)).data;
+      return invite.groupId == groupId &&
+        invite.revoked == false &&
+        (invite.maxUses == null || invite.useCount < invite.maxUses) &&
+        (invite.expiresAt == null || invite.expiresAt > request.time);
+    }
+
+    // ---- users ----
+    match /users/{uid} {
+      // A profile is private to its owner. The app only ever reads/writes a
+      // user's own doc (see useAuth.tsx, firestoreActions.updateUserProfile) —
+      // member-facing display names live on each group's members subcollection
+      // instead, so there's no legitimate need for cross-user reads here, and
+      // `list` must stay closed or any signed-in user (guest included) could
+      // enumerate every profile in the app.
+      allow get: if isSignedIn() && request.auth.uid == uid;
+      allow list: if false;
+      allow create, update: if isSignedIn() && request.auth.uid == uid;
+      allow delete: if false;
+    }
+
+    // ---- groups ----
+    match /groups/{groupId} {
+      allow read: if isGroupMember(groupId);
+      allow create: if isSignedIn() && request.resource.data.createdBy == request.auth.uid;
+
+      // createdBy must stay pinned to the original creator regardless of
+      // which field is being changed — it's the anchor that group-deletion
+      // and member-removal authority are keyed off below, so letting an
+      // ordinary member rewrite it would be a full takeover. Beyond that,
+      // only these exact, narrow field-groups may change, matching the
+      // affectedKeys() style already used for inviteCodes below: renaming
+      // (any active member) or archiving/unarchiving (owner only — checked
+      // on its own, not through isActiveGroupMember, since that would make
+      // unarchiving impossible: you can't be "active" in an archived group).
+      allow update: if request.resource.data.createdBy == resource.data.createdBy &&
+        (
+          (isActiveGroupMember(groupId) &&
+           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])) ||
+          (isGroupOwner(groupId) &&
+           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['archived', 'archivedAt']))
+        );
+
+      // Deleting the group is destructive — Firestore doesn't cascade-delete
+      // its members/expenses/settlements subcollections — so it's restricted
+      // to the group's owner rather than any member.
+      allow delete: if isGroupOwner(groupId);
+
+      // ---- members ----
+      match /members/{memberId} {
+        // Existing members can read the roster. A signed-in user can also
+        // always read their own potential member doc at their own uid, even
+        // before they've joined — redeemInviteCode's transaction checks
+        // whether it already exists as its first step, before membership is
+        // established, and reveals nothing beyond "you are/aren't a member".
+        allow read: if isGroupMember(groupId) || (isSignedIn() && memberId == request.auth.uid);
+
+        // A joining user creates their own member doc (memberId == their uid),
+        // in one of two cases: (a) they're becoming the owner right after
+        // creating this group themselves, or (b) they're redeeming a
+        // still-valid invite code for this exact group. Both are checked
+        // server-side here, not just trusted from client logic, since a
+        // client could otherwise write a member doc for any group without
+        // ever going through invite validation. Existing members may also
+        // create placeholder docs (uid == null) for people who haven't
+        // joined yet, but never a doc claiming a real uid on someone else's
+        // behalf — that would let a member plant a fraudulent identity/role
+        // ahead of that person actually joining.
+        allow create: if (isActiveGroupMember(groupId) && request.resource.data.uid == null) ||
+          (isSignedIn() && memberId == request.auth.uid && request.resource.data.uid == request.auth.uid && (
+            (request.resource.data.role == 'owner' && isGroupOwner(groupId)) ||
+            (request.resource.data.role == 'member' &&
+             request.resource.data.joinedViaCode is string &&
+             isValidInviteForGroup(request.resource.data.joinedViaCode, groupId))
+          ));
+
+        // `role` and `uid` are never writable via update, by anyone — that's
+        // what stops one member from rewriting another's identity,
+        // promoting themselves, or spoofing someone else into apparent
+        // membership by pointing a placeholder's uid at them. Beyond that,
+        // two distinct write shapes are allowed: any other field (e.g. a
+        // placeholder's displayName, or a real member's own fields) by an
+        // active member — and for a real member's doc, only themselves — or
+        // `leftAt` being set for the first time — one-way, nothing else in
+        // the same write — by the member themselves (leave) *or the group
+        // owner acting on someone else's doc* (remove), and never on the
+        // owner's own row: ownership transfer doesn't exist yet, so there's
+        // no one to hand the group to if its owner left. `.get(key,
+        // default)` throughout keeps this safe for docs written before
+        // `leftAt` existed.
+        allow update: if isGroupMember(groupId) &&
+          request.resource.data.role == resource.data.role &&
+          request.resource.data.uid == resource.data.uid &&
+          (
+            (request.resource.data.get('leftAt', null) == resource.data.get('leftAt', null) &&
+             isActiveGroupMember(groupId) &&
+             (resource.data.uid == null || resource.data.uid == request.auth.uid)) ||
+            (resource.data.get('leftAt', null) == null &&
+             request.resource.data.get('leftAt', null) is timestamp &&
+             request.resource.data.diff(resource.data).affectedKeys().hasOnly(['leftAt']) &&
+             (resource.data.uid == request.auth.uid || isGroupOwner(groupId)) &&
+             resource.data.uid != get(/databases/$(database)/documents/groups/$(groupId)).data.createdBy)
+          );
+
+        // Leaving/removal now happens via the update rule above (leftAt),
+        // never delete, so a real member's doc is never removed this way —
+        // that's what keeps every expense/settlement that references it
+        // resolvable forever. Only placeholder cleanup (no uid) still goes
+        // through delete, e.g. as part of merging one into a real member.
+        allow delete: if isGroupMember(groupId) && resource.data.uid == null;
+      }
+
+      // ---- expenses ----
+      match /expenses/{expenseId} {
+        // A member who's left, or a group that's archived, keeps seeing its
+        // expense history — they just can't add to or edit it anymore.
+        allow read: if isGroupMember(groupId);
+        allow write: if isActiveGroupMember(groupId);
+      }
+
+      // ---- settlements ----
+      match /settlements/{settlementId} {
+        allow read: if isGroupMember(groupId);
+        allow write: if isActiveGroupMember(groupId);
+      }
+    }
+
+    // ---- top-level invite codes ----
+    // Redemption happens via a client-side transaction (see redeemInviteCode),
+    // which needs to read a code before the caller is a member of its group.
+    match /inviteCodes/{code} {
+      allow get: if isSignedIn();
+
+      // A group member can list their own group's invites (to show/manage
+      // them). This only works because the client query's required `groupId`
+      // equality filter lets Firestore prove every returned doc belongs to
+      // that group before isGroupMember is even evaluated — an unscoped
+      // query, or one for a group the caller isn't in, is still rejected
+      // outright, so non-enumerability is unaffected.
+      allow list: if isGroupMember(resource.data.groupId);
+
+      // The client picks expiresAt/maxUses, but can't manufacture a code
+      // that starts revoked, pre-used, impersonates another creator, is
+      // already expired, or has a nonsensical use limit. Only an active
+      // member (not left, group not archived) may create one.
+      allow create: if isActiveGroupMember(request.resource.data.groupId) &&
+        request.resource.data.createdBy == request.auth.uid &&
+        request.resource.data.revoked == false &&
+        request.resource.data.useCount == 0 &&
+        (request.resource.data.expiresAt == null ||
+         (request.resource.data.expiresAt is timestamp && request.resource.data.expiresAt > request.time)) &&
+        (request.resource.data.maxUses == null ||
+         (request.resource.data.maxUses is int && request.resource.data.maxUses > 0));
+
+      // Two distinct legitimate writers: the redeem transaction only ever
+      // increments useCount (allowed for any signed-in user, since the
+      // joiner isn't a group member yet mid-redemption), and an active
+      // member of the invite's own group can revoke it by flipping
+      // `revoked` to true — one-way, and nothing else about the code may
+      // change either way.
+      allow update: if isSignedIn() &&
+        (
+          request.resource.data.diff(resource.data).affectedKeys().hasOnly(['useCount']) ||
+          (isActiveGroupMember(resource.data.groupId) &&
+           request.resource.data.diff(resource.data).affectedKeys().hasOnly(['revoked']) &&
+           request.resource.data.revoked == true)
+        );
+
+      allow delete: if isActiveGroupMember(resource.data.groupId);
+    }
+
+    // ---- shared FX rate cache ----
+    // No backend job maintains this yet — any client may need to refresh it
+    // on a cache miss (see getExchangeRates) — so writes can't be blocked
+    // outright. Instead they're bounded to the single known cache document,
+    // to exactly the shape the app writes, to a server-enforced timestamp (so
+    // a client can't fake how fresh its own write is), and — on top of an
+    // existing cache — to genuinely stale windows only. That closes "any
+    // signed-in client can overwrite this with anything, anytime" without
+    // standing up a new backend to own the refresh instead.
+    match /exchangeRates/{docId} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn() &&
+        docId == 'latest' &&
+        request.resource.data.base == 'USD' &&
+        request.resource.data.rates is map &&
+        request.resource.data.rates.size() > 0 &&
+        request.resource.data.asOf is string &&
+        request.resource.data.fetchedAt == request.time;
+
+      allow update: if isSignedIn() &&
+        docId == 'latest' &&
+        request.resource.data.base == 'USD' &&
+        request.resource.data.rates is map &&
+        request.resource.data.rates.size() > 0 &&
+        request.resource.data.asOf is string &&
+        request.resource.data.fetchedAt == request.time &&
+        resource.data.fetchedAt < request.time - duration.value(24, 'h');
+
+      allow delete: if false;
+    }
+  }
+}

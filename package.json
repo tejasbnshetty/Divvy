@@ -1,0 +1,41 @@
+{
+  "name": "divvy",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "oxlint",
+    "preview": "vite preview",
+    "test": "vitest",
+    "test:rules": "firebase emulators:exec --project demo-divvy --only firestore,auth \"vitest run --config vitest.rules.config.ts\""
+  },
+  "dependencies": {
+    "@hookform/resolvers": "^5.9.1",
+    "@tailwindcss/vite": "^4.3.3",
+    "@tanstack/react-query": "^5.102.8",
+    "firebase": "^12.19.0",
+    "framer-motion": "^13.2.0",
+    "radix-ui": "^1.6.7",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "react-hook-form": "^7.88.0",
+    "react-router-dom": "^7.18.3",
+    "tailwindcss": "^4.3.3",
+    "vite-plugin-pwa": "^1.3.0",
+    "zod": "^4.6.4"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^5.0.2",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.7",
+    "@vitejs/plugin-react": "^6.1.1",
+    "firebase-tools": "^15.30.2",
+    "oxlint": "^1.81.0",
+    "typescript": "~6.0.2",
+    "vite": "^8.3.0",
+    "vitest": "^5.0.0"
+  }
+}
