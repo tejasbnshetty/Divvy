@@ -1,0 +1,45 @@
+name: Deploy to Firebase
+
+on:
+  push:
+    branches: [main]
+
+# Avoid two deploys racing if pushes land in quick succession.
+concurrency:
+  group: deploy-main
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm run lint
+
+      - run: npx vitest run
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Firestore rules tests (emulator-backed)
+        run: npm run test:rules
+
+      - run: npm run build
+
+      - name: Write GCP service account credentials
+        run: echo '${{ secrets.FIREBASE_SERVICE_ACCOUNT }}' > "${{ runner.temp }}/gcp-key.json"
+
+      - name: Deploy to Firebase (Hosting + Firestore rules/indexes)
+        run: npx firebase-tools deploy --project divvy-9c76c --non-interactive
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ runner.temp }}/gcp-key.json
