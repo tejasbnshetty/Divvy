@@ -2,6 +2,8 @@
 
 Split bills with friends, in any currency.
 
+**Live:** [divvy-money.vercel.app](https://divvy-money.vercel.app/)
+
 Divvy is a Splitwise-style expense-splitting app: create a group, invite
 friends, log shared expenses, and let Divvy work out who owes whom. With
 support for guest (anonymous) users, multi-currency expenses, and flexible
@@ -17,8 +19,7 @@ splitting (equal, exact, percentage, or shares).
 - **Tailwind CSS v4** for styling
 - **Vitest** for unit tests, plus an emulator-backed Firestore rules test
   suite (`@firebase/rules-unit-testing`)
-- **Firebase Hosting** for deployment, with PWA support via
-  `vite-plugin-pwa`
+- **Vercel** for hosting, with PWA support via `vite-plugin-pwa`
 
 ## Features
 
@@ -72,12 +73,20 @@ required variable names).
 
 ## Deployment
 
-Firestore rules and indexes are defined in `firestore.rules` and
-`firestore.indexes.json`; hosting config is in `firebase.json`. Deploy with
-the Firebase CLI:
+**Hosting** is handled by Vercel's native GitHub integration — every push to
+`main` is built and deployed automatically at
+[divvy-money.vercel.app](https://divvy-money.vercel.app/). No manual steps
+or CI config needed for this part.
+
+**Firestore rules and indexes** (`firestore.rules` and
+`firestore.indexes.json`) are separate from app hosting — Vercel doesn't
+touch Firestore at all — and are deployed via
+[`.github/workflows/firestore-rules.yml`](.github/workflows/firestore-rules.yml),
+which runs the full test suite (lint, unit tests, emulator-backed rules
+tests) before deploying on every push to `main`. To deploy them manually:
 
 ```bash
-firebase deploy
+firebase deploy --only firestore
 ```
 
 ## Project structure
